@@ -4,9 +4,16 @@
   "private": true,
   "type": "module",
   "description": "Minimal Microsoft 365 Chat browser PoC for Windows and Edge.",
-  "engines": { "node": ">=20" },
-  "scripts": {
-    "start": "node src/index.js"
+  "engines": {
+    "node": ">=22.19.0"
   },
-  "dependencies": { "playwright-core": "1.63.0" }
+  "scripts": {
+    "start": "node src/index.js",
+    "agent": "node src/agent.js"
+  },
+  "dependencies": {
+    "@earendil-works/pi-ai": "1.5.0",
+    "@earendil-works/pi-coding-agent": "1.5.0",
+    "playwright-core": "1.63.0"
+  }
 }
