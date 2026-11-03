@@ -1,0 +1,12 @@
+{
+  "name": "copilot-from-chat-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal Microsoft 365 Chat browser PoC for Windows and Edge.",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": { "playwright-core": "1.63.0" }
+}
