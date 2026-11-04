@@ -1,5 +1,4 @@
 import { CopilotBrowser } from './browser.js';
-import { fileURLToPath } from 'node:url';
 
 const browser = new CopilotBrowser();
 let lastText = '', previewActive = false;
@@ -10,27 +9,25 @@ const report = text => {
 };
 
 try {
-  report(`浏览器验证入口：${fileURLToPath(import.meta.url)}`);
-  if (process.argv.length > 2 || process.env.npm_lifecycle_event === 'agent') {
-    throw new Error('当前入口只做固定的浏览器连通验证。执行任务请用 npm run agent -- "任务内容"，并确认 package.json 的 agent 指向 node src/agent.js。');
+  if (process.argv.length > 2) {
+    throw new Error('This command only checks browser connectivity. Use copilot to open the coding agent.');
   }
-  await browser.ask('请只回复：浏览器连接成功', {
+  await browser.ask('Reply exactly: Browser connection successful.', {
     onStatus: report,
     onSnapshot: ({ text }) => {
       const append = text.startsWith(lastText);
-      if (!lastText) report('5. 已读取回复（实时预览，尚未确认结束）：');
-      else if (!append) report('[网页已改写回复，以下全文替换之前的预览]');
-      else if (!previewActive) report('[继续输出]');
+      if (!lastText) report('Reply preview:');
+      else if (!append) report('[The webpage revised the reply; replacing the preview]');
+      else if (!previewActive) report('[Continuing]');
       process.stdout.write(append ? text.slice(lastText.length) : text);
       lastText = text;
       previewActive = true;
     }
   });
-  report('6. 已确认生成结束。');
-  report('请核对网页与终端的回复。关闭 Edge 窗口结束本次验证。');
+  report('Reply complete. Close the Edge window to finish this check.');
 } catch (error) {
-  console.error('\n验证中断：', error.message);
-  if (browser.context) console.error('请检查网页；关闭 Edge 窗口结束本次验证。');
+  console.error('\nBrowser check failed:', error.message);
+  if (browser.context) console.error('Inspect the webpage, then close Edge to finish this check.');
   process.exitCode = 1;
 } finally {
   await browser.closed;
