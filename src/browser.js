@@ -6,7 +6,10 @@ import { mkdir, writeFile } from 'node:fs/promises';
 const CHAT_URL = 'https://m365.cloud.microsoft/chat';
 const PROFILE = fileURLToPath(new URL('../.local/browser-profile', import.meta.url));
 const INPUT_DIAGNOSTIC = new URL('../.local/input-diagnostic.json', import.meta.url);
-const INPUT = '#m365-chat-editor-target-element:visible, [contenteditable="true"][data-lexical-editor="true"]:visible';
+const INPUT = '#m365-chat-editor-target-element:is(input, textarea, [contenteditable="true"]):visible, '
+  + '[contenteditable="true"][data-lexical-editor="true"]:visible, '
+  + '[contenteditable="true"][role="textbox"][aria-label="Message Copilot" i]:visible';
+const COMPOSER_TIMEOUT = 30000;
 const RESPONSES = '[data-testid="markdown-reply"]:visible, [data-message-author-role="assistant"]:visible, [data-author="assistant"]:visible';
 const normalize = text => text.replace(/\r\n?/g, '\n').replace(/^[\s\u200B\u200C\uFEFF]+|[\s\u200B\u200C\uFEFF]+$/g, '');
 const MODEL_NAME = 'GPT-5.6 Sol Think deeper';
@@ -83,9 +86,13 @@ function readReply(elements, previous) {
 
 const replyFingerprint = reply => JSON.stringify(reply.codeBlocks?.length ? reply.codeBlocks : [reply.protocolText ?? reply.text ?? '']);
 
-// Runs inside the page. innerText adds visual paragraph spacing; textContent loses <br> boundaries.
-function readComposerText(el) {
-  if (el.matches('input, textarea')) return el.value;
+// M365 can remount its editor after input, sometimes exposing only the Message Copilot textbox.
+// Read the current DOM with evaluateAll: locator.evaluate waits for a missing element using the
+// global 5-second timeout. A missing editor is NOT an empty draft, and multiple matches are unsafe.
+function readComposerState(elements) {
+  if (elements.length !== 1) return { count: elements.length };
+  const el = elements[0];
+  // innerText adds visual paragraph spacing; textContent loses <br> boundaries.
   const read = node => {
     if (node.nodeType === Node.TEXT_NODE) return node.textContent;
     if (node.nodeType !== Node.ELEMENT_NODE) return '';
@@ -103,7 +110,29 @@ function readComposerText(el) {
     }
     return text;
   };
-  return read(el);
+  return { count: 1, text: el.matches('input, textarea') ? el.value : read(el), contentEditable: el.isContentEditable };
+}
+
+async function readComposer(composer, step) {
+  const state = await composer.evaluateAll(readComposerState);
+  if (state.count > 1) throw new Error(`Multiple Copilot input boxes are visible (step=${step}). Send was not clicked.`);
+  return state.count === 1 ? state : null;
+}
+
+function composerTimeout(step) {
+  return new Error(`The Copilot input box did not become available and stable (step=${step}, timeout=${COMPOSER_TIMEOUT}ms). Send was not clicked; check the draft in the browser.`);
+}
+
+async function waitForComposer(composer, { signal, step }) {
+  // Editor readiness has its own budget, separate from quick UI actions and the reply deadline.
+  const deadline = Date.now() + COMPOSER_TIMEOUT;
+  do {
+    signal?.throwIfAborted();
+    const state = await readComposer(composer, step);
+    if (state) return state;
+    await delay(100, undefined, { signal });
+  } while (Date.now() < deadline);
+  throw composerTimeout(step);
 }
 
 function compareInput(actual, expected, contentEditable) {
@@ -280,7 +309,7 @@ export class CopilotBrowser {
       if (fresh) this.lastReply = null;
       await this.open({ signal, onStatus });
       signal?.throwIfAborted();
-      const draft = normalize(await this.page.locator(INPUT).first().evaluate(readComposerText));
+      const draft = normalize((await waitForComposer(this.page.locator(INPUT), { signal, step: 'read-draft' })).text);
       if (fresh && (this.used || this.uncertain || await this.page.locator(RESPONSES).count()
         || draft)) {
         const old = this.page;
@@ -298,19 +327,19 @@ export class CopilotBrowser {
       if (fresh || !this.used) await this.selectModel({ signal });
       if (fresh) this.uncertain = false;
       const page = this.page;
-      const composer = page.locator(INPUT).first();
+      const composer = page.locator(INPUT);
       const replies = page.locator(RESPONSES);
       const stop = page.locator('button[data-testid="stop-button"]')
         .or(page.getByRole('button', { name: /^(stop(?: generating(?: response)?| responding)?|停止(?:生成|响应|回應)?)(?:\s*\([^)]*\))?$/i }))
         .filter({ visible: true }).first();
-      const readInput = () => composer.evaluate(readComposerText);
+      const input = await waitForComposer(composer, { signal, step: 'prepare-input' });
       if (await stop.isVisible()) throw new Error('The webpage is still generating. Wait for it to finish before trying again.');
-      if (normalize(await readInput())) throw new Error('The webpage contains an unsent draft. Resolve it in the browser before trying again.');
+      if (normalize(input.text)) throw new Error('The webpage contains an unsent draft. Resolve it in the browser before trying again.');
       const previousCount = await replies.count();
       const previous = previousCount ? await replies.last().elementHandle() : null;
       const previousText = previous ? (await previous.innerText()).replace(/\r\n?/g, '\n') : '';
       const lines = message.replace(/\r\n?/g, '\n').split('\n');
-      const contentEditable = await composer.evaluate(el => el.isContentEditable);
+      const contentEditable = input.contentEditable;
       const canUseLineBreaks = lines.length > 1 && contentEditable;
       const expected = normalize(message), attempts = [];
       let actual = '', verified = false;
@@ -319,42 +348,58 @@ export class CopilotBrowser {
         signal?.throwIfAborted();
         if (method === 'lines') {
           // Only replace an unsent draft; never retry after the page appears to have submitted it.
+          const draft = await waitForComposer(composer, { signal, step: 'retry-input' });
           const count = await replies.count();
           if (await stop.isVisible() || count !== previousCount
             || (count && (await replies.last().innerText()).replace(/\r\n?/g, '\n') !== previousText)
-            || !normalize(await readInput())) {
+            || !normalize(draft.text)) {
             this.uncertain = true;
             throw new Error('The webpage changed during input. Stopped editing the draft; check whether it was submitted.');
           }
           onStatus('Retrying input with explicit line breaks...');
-          await composer.fill(lines[0]);
+          await composer.fill(lines[0], { timeout: COMPOSER_TIMEOUT });
           for (const line of lines.slice(1)) {
             signal?.throwIfAborted();
-            await composer.press('Shift+Enter');
+            await composer.press('Shift+Enter', { timeout: COMPOSER_TIMEOUT });
             if (line) await page.keyboard.insertText(line);
           }
         } else {
-          await composer.fill(message);
+          await composer.fill(message, { timeout: COMPOSER_TIMEOUT });
         }
         const started = Date.now(), samples = [];
-        let matchingSince = 0;
+        let matchingSince = 0, availableSince = 0;
         do {
           signal?.throwIfAborted();
-          actual = await readInput();
-          comparison = compareInput(actual, expected, contentEditable);
-          const { matches, ignored } = comparison;
-          samples.push({ elapsedMs: Date.now() - started, length: actual.length, matches, ignored });
-          matchingSince = matches ? matchingSince || Date.now() : 0;
-          if (matchingSince && Date.now() - matchingSince >= 500) { verified = true; break; }
-          await delay(100);
-        } while (Date.now() - started < 3000);
-        const dom = verified ? undefined : await composer.evaluate(el => ({
-          tag: el.tagName, contentEditable: el.isContentEditable, focused: el === document.activeElement || el.contains(document.activeElement),
-          whiteSpace: getComputedStyle(el).whiteSpace, textTransform: getComputedStyle(el).textTransform, maxLength: el.getAttribute('maxlength'),
-          paragraphs: el.querySelectorAll('p').length, lineBreaks: el.querySelectorAll('br').length,
-          value: el.matches('input, textarea') ? el.value : null,
-          innerText: el.innerText, textContent: el.textContent, html: el.outerHTML
-        }));
+          const state = await readComposer(composer, 'verify-input');
+          const now = Date.now();
+          if (!state) {
+            // A remount must not consume the 3-second text-check window or trigger a blind refill.
+            // Once it returns, require a fresh 500 ms of matching text before the single Send click.
+            matchingSince = availableSince = 0;
+          } else {
+            availableSince ||= now;
+            actual = state.text;
+            comparison = compareInput(actual, expected, state.contentEditable);
+            const { matches, ignored } = comparison;
+            samples.push({ elapsedMs: now - started, length: actual.length, matches, ignored });
+            matchingSince = matches ? matchingSince || now : 0;
+            if (matchingSince && now - matchingSince >= 500) { verified = true; break; }
+            if (now - availableSince >= 3000) break;
+          }
+          await delay(100, undefined, { signal });
+        } while (Date.now() - started < COMPOSER_TIMEOUT);
+        if (!verified && Date.now() - started >= COMPOSER_TIMEOUT) throw composerTimeout('verify-input');
+        const dom = verified ? undefined : await composer.evaluateAll(elements => {
+          if (elements.length !== 1) return { count: elements.length };
+          const el = elements[0];
+          return {
+            tag: el.tagName, contentEditable: el.isContentEditable, focused: el === document.activeElement || el.contains(document.activeElement),
+            whiteSpace: getComputedStyle(el).whiteSpace, textTransform: getComputedStyle(el).textTransform, maxLength: el.getAttribute('maxlength'),
+            paragraphs: el.querySelectorAll('p').length, lineBreaks: el.querySelectorAll('br').length,
+            value: el.matches('input, textarea') ? el.value : null,
+            innerText: el.innerText, textContent: el.textContent, html: el.outerHTML
+          };
+        });
         attempts.push({ method, verified, actual, comparison, samples, dom });
         if (!verified) {
           // Capture original browser evidence before changing the draft, even if the fallback later fails.

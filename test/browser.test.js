@@ -31,7 +31,7 @@ async function fixture(t, config = {}) {
       const config = ${JSON.stringify(config)};
       const picker = document.getElementById('picker'), menu = document.getElementById('menu');
       const submenu = document.getElementById('submenu'), target = document.getElementById('target');
-      const composer = document.getElementById('m365-chat-editor-target-element');
+      let composer = document.getElementById('m365-chat-editor-target-element');
       let selected = !!config.selected;
       window.actions = [];
       window.sent = [];
@@ -74,9 +74,27 @@ async function fixture(t, config = {}) {
         if (event.key !== 'Escape') return;
         if (!submenu.hidden) submenu.hidden = true; else menu.hidden = true;
       });
-      composer.oninput = () => { if (composer.textContent) window.inputSelections.push(selected); };
+      const onInput = () => {
+        if (!composer.textContent) return;
+        window.inputSelections.push(selected);
+        if (!config.rebuildEditor || window.rebuilt) return;
+        window.rebuilt = true;
+        const replacement = composer.cloneNode(true);
+        if (config.roleEditor) {
+          replacement.removeAttribute('id');
+          replacement.removeAttribute('data-lexical-editor');
+          replacement.setAttribute('role', 'textbox');
+          replacement.setAttribute('aria-label', 'Message Copilot');
+        }
+        replacement.oninput = onInput;
+        const placeholder = document.createComment('editor remount');
+        composer.replaceWith(placeholder);
+        setTimeout(() => { placeholder.replaceWith(replacement); composer = replacement; }, config.rebuildDelay ?? 0);
+      };
+      composer.oninput = onInput;
       document.getElementById('send').onclick = () => {
-        window.sent.push({ text: composer.textContent, selected });
+        // Simulate the submitted lines; textContent drops the editor's <br> boundaries.
+        window.sent.push({ text: composer.innerText, selected });
         composer.textContent = '';
         const stop = document.getElementById('stop');
         stop.hidden = false;
@@ -181,6 +199,51 @@ test('a hidden checkmark is not accepted as selection and errors do not enter a 
   const browser = await fixture(t, { checkmark: true, compact: true, keepMenu: true, ignore: true });
   if (!browser) return;
   await assert.rejects(browser.ask('Do not send with an unselected model.', { fresh: true }), /step=verify/);
+  assert.deepEqual(await browser.page.evaluate(() => window.sent), []);
+  assert.deepEqual(await browser.page.evaluate(() => window.inputSelections), []);
+});
+
+test('input read-back follows a rebuilt Message Copilot textbox without refilling or resending', async t => {
+  const browser = await fixture(t, { selected: true, rebuildEditor: true, roleEditor: true });
+  if (!browser) return;
+  const text = 'Inspect C:/project/example.js.\n保留这一行。';
+  const statuses = [];
+  assert.equal((await browser.ask(text, { fresh: true, onStatus: status => statuses.push(status) })).completed, true);
+  assert.deepEqual(await browser.page.evaluate(() => window.sent), [{ text, selected: true }]);
+  // One multiline fill can emit several input events; the retry status identifies a second attempt.
+  assert.equal(statuses.some(status => status.startsWith('Retrying input')), false);
+});
+
+test('input read-back survives an editor remount longer than the five-second locator timeout', async t => {
+  const browser = await fixture(t, { selected: true, rebuildEditor: true, rebuildDelay: 5500 });
+  if (!browser) return;
+  browser.context.setDefaultTimeout(5000);
+  const text = 'Send the existing draft exactly once.';
+  assert.equal((await browser.ask(text, { fresh: true })).completed, true);
+  assert.deepEqual(await browser.page.evaluate(() => window.sent), [{ text, selected: true }]);
+  assert.deepEqual(await browser.page.evaluate(() => window.inputSelections), [true]);
+});
+
+test('input read-back stops without refilling or sending if the editor never returns', async t => {
+  const browser = await fixture(t, { selected: true, rebuildEditor: true, rebuildDelay: 60000 });
+  if (!browser) return;
+  const statuses = [];
+  await assert.rejects(browser.ask('Keep this draft.\nDo not resend it.', { fresh: true, onStatus: status => statuses.push(status) }),
+    /step=verify-input, timeout=30000ms.*Send was not clicked/);
+  assert.deepEqual(await browser.page.evaluate(() => window.sent), []);
+  assert.equal(statuses.some(status => status.startsWith('Retrying input')), false);
+  assert.equal(browser.busy, false);
+});
+
+test('multiple matching editors stop input instead of choosing the first one', async t => {
+  const browser = await fixture(t, { selected: true });
+  if (!browser) return;
+  await browser.page.evaluate(() => {
+    const second = document.getElementById('m365-chat-editor-target-element').cloneNode(true);
+    second.removeAttribute('id');
+    document.body.append(second);
+  });
+  await assert.rejects(browser.ask('Do not enter into an ambiguous editor.', { fresh: true }), /Multiple Copilot input boxes/);
   assert.deepEqual(await browser.page.evaluate(() => window.sent), []);
   assert.deepEqual(await browser.page.evaluate(() => window.inputSelections), []);
 });
