@@ -17,7 +17,7 @@ async function fixture(t, config = {}) {
   if (!engine) { t.skip('An installed Edge/Chrome browser is required.'); return; }
   const context = await engine.newContext();
   context.setDefaultTimeout(1500);
-  const html = `<!doctype html><html><body>
+  const html = `<!doctype html><html><head><meta charset="utf-8"></head><body>
     <button id="picker" aria-haspopup="menu">Auto</button>
     <div id="menu" role="menu" hidden><div id="gpt" role="menuitem" tabindex="0" aria-haspopup="menu">GPT</div></div>
     <div id="submenu" role="menu" hidden>
@@ -36,7 +36,7 @@ async function fixture(t, config = {}) {
       window.actions = [];
       window.sent = [];
       window.inputSelections = [];
-      const label = () => config.compact ? 'GPT-5.6 Sol' : 'GPT-5.6 Sol Think deeper';
+      const label = () => config.auto ? (config.autoLabel || 'Auto') : config.compact ? 'GPT-5.6 Sol' : 'GPT-5.6 Sol Think deeper';
       if (config.referenceMarkup) {
         picker.id = 'gptModeSwitcher';
         picker.setAttribute('aria-label', 'Auto, Model Selector');
@@ -47,6 +47,12 @@ async function fixture(t, config = {}) {
         target.innerHTML = '<div class="fai-CapabilityPickerMenuItem__primaryContentWrapper"><h4>GPT-5.6 Sol</h4></div><div>Think deeper</div><p>Spend more time on complex tasks.</p>';
       }
       if (config.labelledPicker) picker.setAttribute('aria-label', 'Auto, Model Selector');
+      if (config.auto) {
+        picker.textContent = 'GPT-5.6 Sol Think deeper';
+        if (config.labelledPicker) picker.setAttribute('aria-label', 'GPT-5.6 Sol Think deeper, Model Selector');
+        target.innerHTML = '<h4>' + label() + '</h4><p>Choose the best model automatically.</p>';
+        menu.append(target);
+      }
       if (config.checkmark) {
         target.removeAttribute('aria-checked');
         const mark = document.createElement('span');
@@ -54,7 +60,10 @@ async function fixture(t, config = {}) {
         mark.innerHTML = '<svg data-testid="checkmark-model" width="10" height="10"><path d="M0 5 L5 10 L10 0" /></svg>';
         target.append(mark);
       }
-      if (selected) { picker.textContent = label(); target.setAttribute('aria-checked', 'true'); }
+      if (selected) {
+        picker.textContent = label(); target.setAttribute('aria-checked', 'true');
+        if (config.labelledPicker) picker.setAttribute('aria-label', label() + ', Model Selector');
+      }
       picker.onclick = () => { window.actions.push('picker'); menu.hidden = !menu.hidden; submenu.hidden = true; };
       const expand = () => { window.actions.push('gpt'); submenu.hidden = false; };
       document.getElementById('gpt').onclick = expand;
@@ -111,7 +120,7 @@ async function fixture(t, config = {}) {
       };
     </script></body></html>`;
   await context.route('https://m365.cloud.microsoft/chat', route => route.fulfill({ contentType: 'text/html', body: html }));
-  const browser = new CopilotBrowser();
+  const browser = new CopilotBrowser({ model: config.auto ? 'Auto' : 'GPT-5.6 Sol Think deeper' });
   browser.context = context;
   browser.page = await context.newPage();
   t.after(() => browser.close());
@@ -142,6 +151,52 @@ test('a model already shown as selected is left unchanged', async t => {
   await browser.selectModel();
   assert.deepEqual(await browser.page.evaluate(() => window.actions), []);
 });
+
+test('the web model can be configured through the environment', t => {
+  const previous = process.env.COPILOT_WEB_MODEL;
+  t.after(() => {
+    if (previous === undefined) delete process.env.COPILOT_WEB_MODEL;
+    else process.env.COPILOT_WEB_MODEL = previous;
+  });
+  process.env.COPILOT_WEB_MODEL = 'auto';
+  assert.equal(new CopilotBrowser().modelName, 'Auto');
+  process.env.COPILOT_WEB_MODEL = 'unknown';
+  assert.throws(() => new CopilotBrowser(), /Unsupported COPILOT_WEB_MODEL/);
+  delete process.env.COPILOT_WEB_MODEL;
+  assert.equal(new CopilotBrowser().modelName, 'Auto');
+});
+
+for (const autoLabel of ['Auto', '自动']) {
+  test(`one-level ${autoLabel} is selected before input and on each new chat`, async t => {
+    const browser = await fixture(t, { auto: true, autoLabel, labelledPicker: true });
+    if (!browser) return;
+    for (const text of ['First Auto task.', 'New Auto task.']) {
+      assert.equal((await browser.ask(text, { fresh: true })).completed, true);
+      assert.deepEqual(await browser.page.evaluate(() => window.actions), ['picker', 'target']);
+      assert.deepEqual(await browser.page.evaluate(() => window.sent), [{ text, selected: true }]);
+      assert.ok((await browser.page.evaluate(() => window.inputSelections)).every(Boolean));
+      assert.equal(await browser.page.getByRole('menu').count(), 0);
+    }
+  });
+}
+
+test('Auto already selected does not open the menu', async t => {
+  const browser = await fixture(t, { auto: true, selected: true, labelledPicker: true });
+  if (!browser) return;
+  await browser.selectModel();
+  assert.deepEqual(await browser.page.evaluate(() => window.actions), []);
+});
+
+for (const scenario of ['missing', 'ignore']) {
+  test(`Auto selection failure (${scenario}) stops before input without entering the GPT submenu`, async t => {
+    const browser = await fixture(t, { auto: true, [scenario]: true });
+    if (!browser) return;
+    await assert.rejects(browser.ask('Do not send.', { fresh: true }), /Could not confirm Auto/);
+    assert.deepEqual(await browser.page.evaluate(() => window.sent), []);
+    assert.deepEqual(await browser.page.evaluate(() => window.inputSelections), []);
+    assert.equal(await browser.page.evaluate(() => window.actions.includes('gpt')), false);
+  });
+}
 
 test('hover submenus and a compact toolbar label use the checked model option for confirmation', async t => {
   const browser = await fixture(t, { hover: true, compact: true });

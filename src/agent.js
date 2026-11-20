@@ -17,6 +17,8 @@ Usage: copilot [options] [prompt]
 Interactive: /new, /web, /quit
 Enter submits; Shift+Enter adds a line; Esc stops the current task.
 Sessions are not saved after exit. Use /new to start a new task.
+Default web model: Auto (one-level option in Edge).
+Set COPILOT_WEB_MODEL="GPT-5.6 Sol Think deeper" to use GPT Think deeper.
 `;
 
 try {

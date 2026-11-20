@@ -14,6 +14,7 @@ const RESPONSES = '[data-testid="markdown-reply"]:visible, [data-message-author-
 const normalize = text => text.replace(/\r\n?/g, '\n').replace(/^[\s\u200B\u200C\uFEFF]+|[\s\u200B\u200C\uFEFF]+$/g, '');
 const MODEL_NAME = 'GPT-5.6 Sol Think deeper';
 const MODEL_LABEL = /^GPT[\s\u2010-\u2015-]*5\.6\s+Sol\s+Think\s+deeper$/i;
+const AUTO_LABEL = /^(?:Auto|自动)$/i;
 
 // M365 controls can have an accessible name such as "Auto, Model Selector", while menu rows
 // include a title AND a description. Read their UI fields separately; never search chat prose.
@@ -155,6 +156,15 @@ function compareInput(actual, expected, contentEditable) {
 // Launch adapted from alexistb2904/m365-copilot-browser-provider, e029fe19891621684e6b4172ca79fa3990a52325.
 // MIT license: licenses/m365-copilot-browser-provider.LICENSE.
 export class CopilotBrowser {
+  constructor({ model = process.env.COPILOT_WEB_MODEL || 'Auto' } = {}) {
+    model = model.trim();
+    if (!AUTO_LABEL.test(model) && !MODEL_LABEL.test(model)) {
+      throw new Error(`Unsupported COPILOT_WEB_MODEL: ${JSON.stringify(model)}. Use Auto or ${MODEL_NAME}.`);
+    }
+    this.modelName = AUTO_LABEL.test(model) ? 'Auto' : MODEL_NAME;
+    this.modelLabel = AUTO_LABEL.test(model) ? AUTO_LABEL : MODEL_LABEL;
+  }
+
   context = null;
   page = null;
   closed = Promise.resolve();
@@ -181,7 +191,7 @@ export class CopilotBrowser {
       .and(page.locator('[role="menu"] *, [role="listbox"] *, .fui-MenuPopover *')).filter({ visible: true });
     let picker, step = 'picker', touchedMenu = false;
     const read = async locator => (await locator.evaluateAll(readModelControls))[0];
-    const matches = info => info?.labels.some(label => MODEL_LABEL.test(label));
+    const matches = info => info?.labels.some(label => this.modelLabel.test(label));
     const wait = async (find, timeout = 5000) => {
       const deadline = Date.now() + timeout;
       do {
@@ -205,8 +215,8 @@ export class CopilotBrowser {
       step = 'menu';
       touchedMenu = true;
       if (!await items.count()) await picker.click();
-      const choice = await wait(async () => await target() ?? await family());
-      if (!choice) throw new Error('The model menu has no matching GPT entry.');
+      const choice = await wait(async () => await target() ?? (this.modelName === 'Auto' ? null : await family()));
+      if (!choice) throw new Error(`The model menu has no matching ${this.modelName} entry.`);
       if (!choice.info.submenu) return choice;
       step = 'gpt-submenu';
       // The family row is often "GPT OpenAI" and its submenu is portalled beside the main menu.
@@ -257,7 +267,7 @@ export class CopilotBrowser {
       } catch { /* The page may have closed; retain the original failure. */ }
       // Short control-only evidence is enough to report from the restricted machine. Do not dump
       // chat content, HTML, account settings or a long Playwright call log into the terminal.
-      throw new Error(`Could not confirm ${MODEL_NAME} (step=${step}). ${cause.message.split('\n')[0]}${evidence} Nothing was entered or sent.`, { cause });
+      throw new Error(`Could not confirm ${this.modelName} (step=${step}). ${cause.message.split('\n')[0]}${evidence} Nothing was entered or sent.`, { cause });
     } finally {
       if (touchedMenu) {
         try {
